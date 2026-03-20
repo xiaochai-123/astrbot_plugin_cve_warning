@@ -45,7 +45,6 @@ class NvdClient:
             headers=headers,
             timeout=self.timeout_s,
         ) as resp:
-            # 429/5xx 直接抛出，交给上层兜底
             resp.raise_for_status()
             data = await resp.json(content_type=None)
 
@@ -58,7 +57,8 @@ class NvdClient:
                 "cwe": [],
             }
 
-        cve_obj = vulns[0].get("cve", {}) if isinstance(vulns[0], dict) else {}
+        first_v = vulns[0] if isinstance(vulns[0], dict) else {}
+        cve_obj = first_v.get("cve", {}) if isinstance(first_v, dict) else {}
         metrics = cve_obj.get("metrics", {}) if isinstance(cve_obj, dict) else {}
 
         # CWE
@@ -70,38 +70,45 @@ class NvdClient:
                     continue
                 descs = w.get("description", [])
                 if isinstance(descs, list) and descs:
-                    # 常见结构：{ "cweId": "...", "description":[{"lang":"en","value":"CWE-79"}] }
-                    # 兜底：取 value
-                    first = descs[0]
-                    if isinstance(first, dict):
-                        val = first.get("value")
+                    first_desc = descs[0]
+                    if isinstance(first_desc, dict):
+                        val = first_desc.get("value")
                         if isinstance(val, str) and val.strip():
                             cwe_list.append(val.strip())
 
         # CVSS v3.1 > v3.0 > v2.0
-        def _pick_cvss(cvss_metrics_key: str) -> dict[str, Any] | None:
-            raw = metrics.get(cvss_metrics_key)
+        def _pick_metric(key: str) -> dict[str, Any] | None:
+            raw = metrics.get(key)
             if isinstance(raw, list) and raw:
                 first = raw[0]
                 if isinstance(first, dict):
                     return first
             return None
 
-        cvss_entry = (
-            _pick_cvss("cvssMetricV31")
-            or _pick_cvss("cvssMetricV30")
-            or _pick_cvss("cvssMetricV2")
-        )
+        cvss_entry = _pick_metric("cvssMetricV31") or _pick_metric("cvssMetricV30") or _pick_metric("cvssMetricV2")
 
-        cvss_base_score = None
-        cvss_base_severity = None
-        cvss_vector = None
+        cvss_base_score: float | None = None
+        cvss_base_severity: str | None = None
+        cvss_vector: str | None = None
 
         if isinstance(cvss_entry, dict):
-            # v3/v2 的字段名略有差异：baseScore/baseSeverity/vectorString
-            base_score = cvss_entry.get("baseScore")
-            base_sev = cvss_entry.get("baseSeverity")
-            vector = cvss_entry.get("vectorString")
+            # NVD 2.0 常见结构：字段在 cvssData 下
+            cvss_data = cvss_entry.get("cvssData") if isinstance(cvss_entry.get("cvssData"), dict) else None
+
+            base_score = None
+            base_sev = None
+            vector = None
+
+            if isinstance(cvss_data, dict):
+                base_score = cvss_data.get("baseScore")
+                # v3: baseSeverity 在 cvssData；v2 有时在 entry 顶层
+                base_sev = cvss_data.get("baseSeverity") or cvss_entry.get("baseSeverity")
+                vector = cvss_data.get("vectorString") or cvss_entry.get("vectorString")
+            else:
+                # 兜底：旧逻辑（某些实现可能直接把字段放顶层）
+                base_score = cvss_entry.get("baseScore")
+                base_sev = cvss_entry.get("baseSeverity")
+                vector = cvss_entry.get("vectorString")
 
             if isinstance(base_score, (int, float)):
                 cvss_base_score = float(base_score)
@@ -116,4 +123,3 @@ class NvdClient:
             "cvss_vector": cvss_vector,
             "cwe": cwe_list,
         }
-

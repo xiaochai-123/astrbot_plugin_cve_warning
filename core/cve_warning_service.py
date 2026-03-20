@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import aiohttp
@@ -18,11 +18,17 @@ from .state_store import JsonStateStore
 
 @dataclass
 class RefreshResult:
-    pushed: int = 0
-    skipped_already_pushed: int = 0
+    ok: bool = True
+    error: str | None = None
+
+    pushed: int = 0  # 本轮“全局完成推送”的数量（所有 session 都成功）
     processed: int = 0
-    skipped_by_severity: int = 0
     total_candidates: int = 0
+
+    skipped_already_pushed: int = 0
+    skipped_by_severity: int = 0
+    skipped_already_delivered: int = 0
+
     last_catalog_version: str | None = None
 
 
@@ -53,14 +59,21 @@ class CVEWarningService:
         self.push_only_new = bool(dedup_cfg.get("push_only_new", True))
         self.state_max_entries = int(dedup_cfg.get("state_max_entries", 5000))
 
-        self.kev_fetch_retry_count = int(config.get("kev_fetch_retry_count", 3))
-        self.kev_fetch_retry_interval_seconds = int(
-            config.get("kev_fetch_retry_interval_seconds", 10)
+        # 新增：state 里其他集合的容量（不写 schema 也能工作，直接取默认）
+        self.seen_max_entries = int(dedup_cfg.get("seen_max_entries", 20000)) if isinstance(dedup_cfg, dict) else 20000
+        self.delivered_max_entries_per_session = (
+            int(dedup_cfg.get("delivered_max_entries_per_session", self.state_max_entries))
+            if isinstance(dedup_cfg, dict)
+            else self.state_max_entries
+        )
+        self.cvss_cache_max_entries = (
+            int(dedup_cfg.get("cvss_cache_max_entries", 20000)) if isinstance(dedup_cfg, dict) else 20000
         )
 
-        self.failure_notify_sessions = self._normalize_sessions(
-            config.get("failure_notify_sessions", [])
-        )
+        self.kev_fetch_retry_count = int(config.get("kev_fetch_retry_count", 3))
+        self.kev_fetch_retry_interval_seconds = int(config.get("kev_fetch_retry_interval_seconds", 10))
+
+        self.failure_notify_sessions = self._normalize_sessions(config.get("failure_notify_sessions", []))
         self.cvss_cache_ttl_days = int(config.get("cvss_cache_ttl_days", 30))
 
         self.target_sessions: list[str] = []
@@ -70,6 +83,9 @@ class CVEWarningService:
             state_file_name="state.json",
             state_max_entries=self.state_max_entries,
             cvss_cache_ttl_days=self.cvss_cache_ttl_days,
+            seen_max_entries=self.seen_max_entries,
+            delivered_max_entries_per_session=self.delivered_max_entries_per_session,
+            cvss_cache_max_entries=self.cvss_cache_max_entries,
         )
 
         self._session: aiohttp.ClientSession | None = None
@@ -93,9 +109,7 @@ class CVEWarningService:
             logger.warning("[CVE漏洞推送] 当前未配置 target_sessions，将只更新状态不推送消息。")
 
         self._session = aiohttp.ClientSession()
-        self._kev_client = CisaKevClient(
-            self._session, feed_url=self.kev_feed_url, timeout_s=30
-        )
+        self._kev_client = CisaKevClient(self._session, feed_url=self.kev_feed_url, timeout_s=30)
         self._nvd_client = NvdClient(
             self._session,
             api_key=self.nvd_api_key,
@@ -105,7 +119,7 @@ class CVEWarningService:
         await self._state.load()
 
         self._running = True
-        # 启动时立即执行一次
+        # 启动时立即执行一次（启动失败会记录并通知）
         await self.refresh_and_push(reason="startup")
 
         # 定时循环
@@ -114,7 +128,7 @@ class CVEWarningService:
 
     async def _run_loop(self) -> None:
         while self._running:
-            self._next_run_at = datetime.now(timezone.utc) + timedelta_seconds(self.interval_seconds)
+            self._next_run_at = datetime.now(timezone.utc) + timedelta(seconds=self.interval_seconds)
             try:
                 await asyncio.sleep(self.interval_seconds)
                 await self.refresh_and_push(reason="scheduled")
@@ -150,12 +164,23 @@ class CVEWarningService:
         }
 
     async def refresh_and_push(self, reason: str) -> RefreshResult:
+        """
+        重要语义：
+        - 发生“拉取失败/关键异常”时：返回 ok=False 且（对于 manual/startup）会抛异常，保证上层提示可信。
+        - severity 过滤：只 mark_seen，不 mark_pushed（避免开启低中危后无法补发）。
+        - 投递去重：按 session 记录 delivered；失败的 session 下次仍会补发；成功的 session 不会重复轰炸。
+        - 只有当所有目标 session 都 delivered 成功时，才 mark_cve_pushed（全局完成）。
+        """
         if not self._kev_client or not self._nvd_client:
-            return RefreshResult()
+            return RefreshResult(ok=False, error="service_not_ready")
 
         async with self._refresh_lock:
             self._last_refresh_at = datetime.now(timezone.utc)
             result = RefreshResult()
+
+            def _should_raise() -> bool:
+                # 手动刷新/启动时，强制让错误可见；定时任务不抛，避免把 loop 打死
+                return reason in {"startup", "manual"}
 
             try:
                 catalog = None
@@ -181,16 +206,18 @@ class CVEWarningService:
                 if isinstance(vulns, list):
                     entries = [v for v in vulns if isinstance(v, dict)]
 
-                result.last_catalog_version = catalog_version
+                result.last_catalog_version = catalog_version if isinstance(catalog_version, str) else None
                 result.total_candidates = len(entries)
-                self._state.set_last_catalog_version(catalog_version if isinstance(catalog_version, str) else None)
+
+                self._state.set_last_catalog_version(result.last_catalog_version)
                 self._state.set_last_fetch_at(datetime.now(timezone.utc).isoformat())
 
                 if not entries:
                     await self._state.save()
                     return result
 
-                new_entries: list[dict[str, Any]] = []
+                # 先筛“候选”：push_only_new 时，跳过已全局 pushed 的（legacy 语义）
+                candidates: list[dict[str, Any]] = []
                 skipped = 0
                 for e in entries:
                     cve_id = str(e.get("cveID") or "").strip()
@@ -199,19 +226,29 @@ class CVEWarningService:
                     if self.push_only_new and self._state.is_cve_pushed(cve_id):
                         skipped += 1
                         continue
-                    new_entries.append(e)
-
+                    candidates.append(e)
                 result.skipped_already_pushed = skipped
 
-                # 保守处理：只推送前 N 个“新增候选”，避免一次拉取造成刷屏
-                new_entries = new_entries[: self.max_push_per_run]
+                # 限流：最多处理 N 个候选
+                candidates = candidates[: self.max_push_per_run]
 
-                pushed_ok = 0
-                for entry in new_entries:
+                for entry in candidates:
                     cve_id = str(entry.get("cveID") or "").strip()
                     if not cve_id:
                         continue
 
+                    # 注意：如果所有 session 都已 delivered，就可以直接算“已处理”
+                    if self.target_sessions:
+                        all_delivered = all(self._state.is_cve_delivered(s, cve_id) for s in self.target_sessions)
+                        if all_delivered:
+                            result.skipped_already_delivered += 1
+                            result.processed += 1
+                            # 同步一下全局 pushed（用于 push_only_new 的快速跳过）
+                            if not self._state.is_cve_pushed(cve_id):
+                                await self._state.mark_cve_pushed(cve_id)
+                            continue
+
+                    # CVSS cache
                     cvss_info = self._state.get_cvss_cached(cve_id)
                     if not cvss_info:
                         try:
@@ -235,8 +272,8 @@ class CVEWarningService:
                     if (not self.enable_low_medium) and bucket in {"MEDIUM", "LOW", "UNKNOWN"}:
                         result.skipped_by_severity += 1
                         result.processed += 1
-                        # 也算处理过：避免下次刷新重复命中同一条 CVE。
-                        await self._state.mark_cve_pushed(cve_id)
+                        # 只标记“已见过”，不标记 pushed（避免后续打开低中危无法补发）
+                        await self._state.mark_cve_seen(cve_id)
                         continue
 
                     msg_text = build_cve_message(
@@ -248,35 +285,50 @@ class CVEWarningService:
                         display_timezone=self.display_timezone,
                     )
 
-                    # 目标会话推送
-                    ok_all = True
+                    # 目标会话推送：按 session 粒度去重与补发
                     ok_any = False
+                    ok_all = True
+
                     for session in self.target_sessions:
+                        # 已成功投递过的 session 不重复发
+                        if self._state.is_cve_delivered(session, cve_id):
+                            continue
+
                         try:
                             msg_chain = MessageChain([Comp.Plain(msg_text)])
                             await self.context.send_message(session, msg_chain)
                             ok_any = True
+                            await self._state.mark_cve_delivered(session, cve_id)
                         except Exception as send_e:
                             ok_all = False
                             logger.warning(f"[CVE漏洞推送] 推送失败 session={session} cve={cve_id}: {send_e}")
 
                     result.processed += 1
-                    # 只有当“所有目标会话”都推送成功时才写入去重状态，
-                    # 避免出现部分会话漏推但被误判为已推送。
-                    if ok_any and ok_all:
-                        await self._state.mark_cve_pushed(cve_id)
-                        pushed_ok += 1
 
-                result.pushed = pushed_ok
-                if pushed_ok > 0:
-                    self._state.set_last_push_at(datetime.now(timezone.utc).isoformat())
+                    # 没有 target_sessions 也算处理过（仅更新状态）
+                    if not self.target_sessions:
+                        ok_any = True
+                        ok_all = True
+
+                    # 只有当“所有目标会话”都投递成功时才算全局 pushed
+                    if ok_any and ok_all:
+                        if not self._state.is_cve_pushed(cve_id):
+                            await self._state.mark_cve_pushed(cve_id)
+                        result.pushed += 1
+                        self._state.set_last_push_at(datetime.now(timezone.utc).isoformat())
+                    else:
+                        # 至少标记 seen，避免下次每次都重新走一遍重逻辑（但不影响补发失败会话）
+                        await self._state.mark_cve_seen(cve_id)
 
                 await self._state.save()
                 return result
 
             except Exception as e:
+                result.ok = False
+                result.error = str(e)
                 logger.error(f"[CVE漏洞推送] refresh_and_push 失败: {e}")
-                # 失败不保存 pushed 状态，避免误去重
+
+                # 失败不保存 pushed 状态，避免误去重（但本次 run 内可能写了 delivered/seen；这里不保存即可回滚到上次持久化）
                 if self.failure_notify_sessions and reason in {"startup", "manual"}:
                     try:
                         fail_text = f"❌ [CVE漏洞推送] 初始化/手动刷新失败：{e}"
@@ -285,6 +337,9 @@ class CVEWarningService:
                             await self.context.send_message(session, msg_chain)
                     except Exception:
                         pass
+
+                if _should_raise():
+                    raise
                 return result
 
     @staticmethod
@@ -296,11 +351,3 @@ class CVEWarningService:
             if isinstance(v, str) and v.strip():
                 result.append(v.strip())
         return result
-
-
-def timedelta_seconds(seconds: int) -> Any:
-    # 使用函数封装，避免 import timedelta 但仍保持可读性
-    from datetime import timedelta
-
-    return timedelta(seconds=seconds)
-

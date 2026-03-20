@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -37,6 +38,76 @@ def get_severity_bucket(
     return _severity_bucket(base_severity, base_score)
 
 
+def _parse_tz(display_timezone: str) -> timezone | None:
+    """
+    支持：
+    - "UTC"
+    - "UTC+8" / "UTC+08:00" / "UTC-5" 等
+    解析失败返回 None（则保持原字符串）
+    """
+    if not isinstance(display_timezone, str):
+        return None
+    s = display_timezone.strip().upper()
+    if not s:
+        return None
+    if s == "UTC":
+        return timezone.utc
+    if not s.startswith("UTC"):
+        return None
+
+    tail = s[3:].strip()
+    if not tail:
+        return timezone.utc
+
+    sign = 1
+    if tail[0] == "+":
+        sign = 1
+        tail = tail[1:]
+    elif tail[0] == "-":
+        sign = -1
+        tail = tail[1:]
+    else:
+        return None
+
+    tail = tail.strip()
+    if not tail:
+        return None
+
+    # "8" or "08:00"
+    try:
+        if ":" in tail:
+            hh_str, mm_str = tail.split(":", 1)
+            hh = int(hh_str)
+            mm = int(mm_str)
+        else:
+            hh = int(tail)
+            mm = 0
+        offset = sign * (hh * 60 + mm)
+        return timezone(timedelta(minutes=offset))
+    except Exception:
+        return None
+
+
+def _format_kev_date(date_str: str, tz: timezone | None) -> str:
+    """
+    KEV 里 dateAdded/dueDate 通常是 YYYY-MM-DD（无时分秒）。
+    将其当作 UTC 的 00:00:00，再转换为 tz 显示（仅显示日期）。
+    解析失败返回原始字符串。
+    """
+    if not isinstance(date_str, str) or not date_str.strip():
+        return ""
+    raw = date_str.strip()
+    if tz is None:
+        return raw
+    try:
+        # treat as UTC date at midnight
+        dt_utc = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone(tz)
+        return dt_local.strftime("%Y-%m-%d")
+    except Exception:
+        return raw
+
+
 def build_cve_message(
     kev_entry: dict[str, Any],
     cvss_info: dict[str, Any],
@@ -59,6 +130,10 @@ def build_cve_message(
     due_date = str(kev_entry.get("dueDate") or "").strip()
     date_added = str(kev_entry.get("dateAdded") or "").strip()
     known_ransom = str(kev_entry.get("knownRansomwareCampaignUse") or "").strip()
+
+    tz = _parse_tz(display_timezone)
+    due_date_fmt = _format_kev_date(due_date, tz) if due_date else ""
+    date_added_fmt = _format_kev_date(date_added, tz) if date_added else ""
 
     base_score = cvss_info.get("cvss_base_score")
     base_sev = cvss_info.get("cvss_base_severity")
@@ -83,7 +158,6 @@ def build_cve_message(
     # 已知勒索使用信息（可选）
     ransom_line = ""
     if known_ransom:
-        # schema 里为 'Known'/'Unknown'（或其它）
         ransom_line = f"\n🍷 勒索已知利用：{known_ransom}"
 
     # 详细字段
@@ -92,11 +166,11 @@ def build_cve_message(
         vendor_line = f"\n🏢 影响范围：{vendor}{' / ' if vendor and product else ''}{product}".strip()
 
     due_line = ""
-    if due_date:
-        due_line = f"\n⏰ 处置到期：{due_date}"
+    if due_date_fmt:
+        due_line = f"\n⏰ 处置到期：{due_date_fmt}"
     added_line = ""
-    if date_added:
-        added_line = f"\n📌 加入日期：{date_added}"
+    if date_added_fmt:
+        added_line = f"\n📌 加入日期：{date_added_fmt}"
 
     required_line = ""
     if detailed and required_action:
@@ -140,4 +214,3 @@ def build_cve_message(
             f"\n🔗 NVD：{nvd_link}",
         ]
     ).replace("\n\n\n", "\n\n")
-

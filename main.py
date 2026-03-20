@@ -1,10 +1,8 @@
 import asyncio
-from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-import astrbot.api.message_components as Comp
 
 from .core.cve_warning_service import CVEWarningService
 
@@ -20,28 +18,41 @@ class CVEWarningPlugin(Star):
         self.service: CVEWarningService | None = None
         self._service_task: asyncio.Task[None] | None = None
 
-    async def initialize(self):
-        try:
-            logger.info("[CVE漏洞推送] 正在初始化...")
-            if not self.config.get("enabled", True):
-                logger.info("[CVE漏洞推送] 插件已禁用，跳过初始化")
-                return
+    async def initialize(self) -> None:
+        logger.info("[CVE漏洞推送] 正在初始化...")
+        if not self.config.get("enabled", True):
+            logger.info("[CVE漏洞推送] 插件已禁用，跳过初始化")
+            return
 
-            self.service = CVEWarningService(config=dict(self.config), context=self.context)
-            self._service_task = asyncio.create_task(
-                self.service.start(), name="cve_warning_service_task"
-            )
-            logger.info("[CVE漏洞推送] 初始化完成，服务已启动")
+        self.service = CVEWarningService(config=dict(self.config), context=self.context)
+        self._service_task = asyncio.create_task(
+            self.service.start(), name="cve_warning_service_task"
+        )
+        self._service_task.add_done_callback(self._on_service_task_done)
+        logger.info("[CVE漏洞推送] 初始化完成，服务已启动")
+
+    def _on_service_task_done(self, task: asyncio.Task[None]) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
         except Exception as e:
-            logger.error(f"[CVE漏洞推送] 初始化失败: {e}")
-            raise
+            logger.error(f"[CVE漏洞推送] 后台任务状态获取失败: {e}")
+            return
 
-    async def terminate(self):
+        if exc is not None:
+            logger.error(f"[CVE漏洞推送] 后台服务异常退出: {exc!r}")
+            # 让状态命令能明确显示“服务存在但已死”
+            self.service = None
+            self._service_task = None
+
+    async def terminate(self) -> None:
+        logger.info("[CVE漏洞推送] 正在停止服务...")
         try:
-            logger.info("[CVE漏洞推送] 正在停止服务...")
+            if self.service:
+                await self.service.stop()
+
             if self._service_task and not self._service_task.done():
-                if self.service:
-                    await self.service.stop()
                 self._service_task.cancel()
                 try:
                     await self._service_task
@@ -69,7 +80,7 @@ class CVEWarningPlugin(Star):
             return
 
         if not self.service:
-            yield event.plain_result("❌ 服务未启动")
+            yield event.plain_result("❌ 服务未启动（或已异常退出）")
             return
 
         try:
@@ -97,13 +108,24 @@ class CVEWarningPlugin(Star):
             return
 
         if not self.service:
-            yield event.plain_result("❌ 服务未启动")
+            yield event.plain_result("❌ 服务未启动（或已异常退出）")
             return
 
         try:
-            # 直接触发一次刷新逻辑
-            await self.service.refresh_and_push(reason="manual")
-            yield event.plain_result("✅ 已触发手动刷新（查看状态可确认）。")
+            res = await self.service.refresh_and_push(reason="manual")
+            if getattr(res, "ok", True) is False:
+                err = getattr(res, "error", None) or "unknown_error"
+                yield event.plain_result(f"❌ 手动刷新失败：{err}")
+                return
+
+            yield event.plain_result(
+                "✅ 手动刷新完成："
+                f"pushed={getattr(res, 'pushed', 0)} "
+                f"processed={getattr(res, 'processed', 0)} "
+                f"skipped_by_severity={getattr(res, 'skipped_by_severity', 0)} "
+                f"skipped_already_pushed={getattr(res, 'skipped_already_pushed', 0)} "
+                f"skipped_already_delivered={getattr(res, 'skipped_already_delivered', 0)}"
+            )
         except Exception as e:
             logger.error(f"[CVE漏洞推送] 手动刷新失败: {e}")
             yield event.plain_result(f"❌ 手动刷新失败: {e}")
@@ -112,12 +134,18 @@ class CVEWarningPlugin(Star):
         if event.is_admin():
             return True
 
+        # 归一化为 str，避免平台返回 int/None 导致 in 判断恒 False
         sender_id = event.get_sender_id()
-        plugin_admins: list[str] = self.config.get("admin_users", []) or []
-        return sender_id in plugin_admins
+        sender_id_str = str(sender_id).strip() if sender_id is not None else ""
+
+        raw_admins = self.config.get("admin_users", []) or []
+        if not isinstance(raw_admins, list):
+            return False
+
+        plugin_admins = [str(x).strip() for x in raw_admins if str(x).strip()]
+        return sender_id_str in plugin_admins
 
 
 @filter.on_astrbot_loaded()
 async def _on_loaded():
     logger.debug("[CVE漏洞推送] AstrBot 已加载完成（插件将按生命周期启动服务）。")
-
