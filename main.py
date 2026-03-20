@@ -1,10 +1,8 @@
 import asyncio
-from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-import astrbot.api.message_components as Comp
 
 from .core.cve_warning_service import CVEWarningService
 
@@ -31,10 +29,23 @@ class CVEWarningPlugin(Star):
             self._service_task = asyncio.create_task(
                 self.service.start(), name="cve_warning_service_task"
             )
+            self._service_task.add_done_callback(self._on_service_task_done)
             logger.info("[CVE漏洞推送] 初始化完成，服务已启动")
         except Exception as e:
             logger.error(f"[CVE漏洞推送] 初始化失败: {e}")
             raise
+
+    def _on_service_task_done(self, task: asyncio.Task[None]) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error(f"[CVE漏洞推送] 服务任务状态检查失败: {e}")
+            return
+
+        if exc is not None:
+            logger.error("[CVE漏洞推送] 后台服务任务异常退出", exc_info=exc)
 
     async def terminate(self):
         try:
@@ -101,9 +112,13 @@ class CVEWarningPlugin(Star):
             return
 
         try:
-            # 直接触发一次刷新逻辑
-            await self.service.refresh_and_push(reason="manual")
-            yield event.plain_result("✅ 已触发手动刷新（查看状态可确认）。")
+            r = await self.service.refresh_and_push(reason="manual")
+            if getattr(r, "ok", False):
+                yield event.plain_result(
+                    f"✅ 手动刷新成功：processed={r.processed} pushed={r.pushed} skipped_by_severity={r.skipped_by_severity} skipped_already_pushed={r.skipped_already_pushed}"
+                )
+            else:
+                yield event.plain_result(f"❌ 手动刷新失败：{getattr(r, 'error', '')}")
         except Exception as e:
             logger.error(f"[CVE漏洞推送] 手动刷新失败: {e}")
             yield event.plain_result(f"❌ 手动刷新失败: {e}")
@@ -112,12 +127,14 @@ class CVEWarningPlugin(Star):
         if event.is_admin():
             return True
 
-        sender_id = event.get_sender_id()
-        plugin_admins: list[str] = self.config.get("admin_users", []) or []
-        return sender_id in plugin_admins
+        sender_id_norm = str(event.get_sender_id()).strip()
+        raw_admins = self.config.get("admin_users", []) or []
+        plugin_admins = {
+            str(x).strip() for x in raw_admins if str(x).strip()
+        }
+        return sender_id_norm in plugin_admins
 
 
 @filter.on_astrbot_loaded()
 async def _on_loaded():
     logger.debug("[CVE漏洞推送] AstrBot 已加载完成（插件将按生命周期启动服务）。")
-
