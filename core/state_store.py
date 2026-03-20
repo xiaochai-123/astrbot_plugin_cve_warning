@@ -12,9 +12,9 @@ from astrbot.api.star import StarTools
 class JsonStateStore:
     """
     轻量状态存储：
-    - pushed_at_by_cve: 全局“该 CVE 已完成推送”（用于 legacy/兼容、以及 push_only_new 逻辑）
-    - seen_at_by_cve:   “该 CVE 已被扫描到/处理过”（用于 severity 过滤时避免每轮都命中）
-    - delivered_at_by_session: 按 session 粒度记录投递成功状态，避免部分失败导致重复轰炸
+    - pushed_at_by_cve: 全局“该 CVE 已完成推送”（legacy；用于 push_only_new 逻辑）
+    - seen_at_by_cve:   “该 CVE 已被扫描到/处理过”（severity 过滤时避免每轮都命中）
+    - delivered_at_by_session: 按 session 粒度记录投递成功状态，避免部分失败导致成功会话重复轰炸
       delivered_at_by_session[session][cve_id] = iso
     - cvss_cache: CVSS 缓存（减少 NVD 请求）
       cvss_cache[cve_id] = {"stored_at_iso": "...", "data": {...}}
@@ -27,7 +27,6 @@ class JsonStateStore:
         state_max_entries: int = 5000,
         cvss_cache_ttl_days: int = 30,
         *,
-        # 新增：seen/delivered/cvss_cache 的总量治理（默认值偏保守，避免状态文件膨胀）
         seen_max_entries: int = 20000,
         delivered_max_entries_per_session: int = 5000,
         cvss_cache_max_entries: int = 20000,
@@ -48,8 +47,6 @@ class JsonStateStore:
         # in-memory
         self.pushed_at_by_cve: dict[str, str] = {}
         self.seen_at_by_cve: dict[str, str] = {}
-
-        # delivered_at_by_session[session][cve_id] = iso str
         self.delivered_at_by_session: dict[str, dict[str, str]] = {}
 
         # cvss_cache[cve_id] = {"stored_at_iso": "...", "data": {...}}
@@ -60,7 +57,7 @@ class JsonStateStore:
         self.last_fetch_at_iso: str | None = None
         self.last_push_at_iso: str | None = None
 
-        # keep insertion order for pruning
+        # orders for pruning
         self._pushed_order: deque[str] = deque()
         self._seen_order: deque[str] = deque()
         self._delivered_order_by_session: dict[str, deque[str]] = {}
@@ -81,7 +78,6 @@ class JsonStateStore:
                     self._rebuild_orders()
                     return
 
-                # pushed
                 pushed = data.get("pushed_at_by_cve", {})
                 if isinstance(pushed, dict):
                     self.pushed_at_by_cve = {
@@ -90,7 +86,6 @@ class JsonStateStore:
                         if isinstance(k, str) and isinstance(v, str)
                     }
 
-                # seen
                 seen = data.get("seen_at_by_cve", {})
                 if isinstance(seen, dict):
                     self.seen_at_by_cve = {
@@ -99,7 +94,6 @@ class JsonStateStore:
                         if isinstance(k, str) and isinstance(v, str)
                     }
 
-                # delivered
                 delivered = data.get("delivered_at_by_session", {})
                 rebuilt_delivered: dict[str, dict[str, str]] = {}
                 if isinstance(delivered, dict):
@@ -113,7 +107,6 @@ class JsonStateStore:
                         }
                 self.delivered_at_by_session = rebuilt_delivered
 
-                # cvss cache
                 cache = data.get("cvss_cache", {})
                 if isinstance(cache, dict):
                     rebuilt_cvss: dict[str, dict[str, Any]] = {}
@@ -123,7 +116,6 @@ class JsonStateStore:
                         if "data" in v and isinstance(v.get("data"), dict):
                             rebuilt_cvss[k] = v
                         else:
-                            # 兼容：旧格式直接是 data dict
                             rebuilt_cvss[k] = {"stored_at_iso": None, "data": v}
                     self.cvss_cache = rebuilt_cvss
 
@@ -135,11 +127,7 @@ class JsonStateStore:
                 self._prune_all_unsafe()
             except Exception as e:
                 logger.error(f"[CVE漏洞推送] 状态加载失败，将使用空状态: {e}")
-                # 保证 orders 有效
                 self._rebuild_orders()
-
-    def _rebuild_orders(self) -> None:
-        self._rebuild_orders()
 
     def _rebuild_orders(self) -> None:
         # pushed
@@ -155,18 +143,19 @@ class JsonStateStore:
         # delivered
         self._delivered_order_by_session = {}
         for sess, m in self.delivered_at_by_session.items():
+            if not isinstance(m, dict):
+                continue
             items = list(m.items())
             items.sort(key=lambda kv: kv[1])
             self._delivered_order_by_session[sess] = deque([cve for cve, _ in items])
 
         # cvss
-        cvss_items = []
+        cvss_items: list[tuple[str, str]] = []
         for cve_id, v in self.cvss_cache.items():
             if not isinstance(v, dict):
                 continue
             stored_at = v.get("stored_at_iso")
-            # None 放到最早，便于尽快被淘汰
-            cvss_items.append((cve_id, stored_at or ""))
+            cvss_items.append((cve_id, stored_at if isinstance(stored_at, str) else ""))
         cvss_items.sort(key=lambda kv: kv[1])
         self._cvss_order = deque([cve for cve, _ in cvss_items])
 
@@ -261,11 +250,10 @@ class JsonStateStore:
                     stored_dt = stored_dt.replace(tzinfo=timezone.utc)
                 age_days = (datetime.now(timezone.utc) - stored_dt).days
                 if age_days >= self.cvss_cache_ttl_days:
-                    # expired
                     self._delete_cvss_entry(cve_id)
                     return None
             except Exception:
-                # 旧逻辑会“永久不过期”。这里改为：当作损坏数据，直接删除，避免僵尸缓存。
+                # 时间戳损坏：删除，避免“僵尸缓存永久不过期”
                 self._delete_cvss_entry(cve_id)
                 return None
 
@@ -315,7 +303,6 @@ class JsonStateStore:
             d.pop(old, None)
 
     def _prune_all_unsafe(self) -> None:
-        # 确保 load 后也不会无限膨胀
         self._prune_dict_by_order(self.pushed_at_by_cve, self._pushed_order, self.state_max_entries)
         self._prune_dict_by_order(self.seen_at_by_cve, self._seen_order, self.seen_max_entries)
         self._prune_dict_by_order(self.cvss_cache, self._cvss_order, self.cvss_cache_max_entries)
@@ -325,10 +312,12 @@ class JsonStateStore:
                 self.delivered_at_by_session.pop(sess, None)
                 self._delivered_order_by_session.pop(sess, None)
                 continue
+
             order = self._delivered_order_by_session.get(sess)
             if order is None:
                 items = list(m.items())
                 items.sort(key=lambda kv: kv[1])
                 order = deque([cve for cve, _ in items])
                 self._delivered_order_by_session[sess] = order
+
             self._prune_dict_by_order(m, order, self.delivered_max_entries_per_session)
