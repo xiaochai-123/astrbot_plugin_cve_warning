@@ -14,7 +14,7 @@ class JsonStateStore:
     轻量状态存储：
     - pushed_at_by_cve: 全局“该 CVE 已完成推送”（legacy；用于 push_only_new 逻辑）
     - seen_at_by_cve:   “该 CVE 已被扫描到/处理过”（severity 过滤时避免每轮都命中）
-    - delivered_at_by_session: 按 session 粒度记录投递成功状态，避免部分失败导致成功会话重复轰炸
+    - delivered_at_by_session: 按 session 粒度记录投递成功状态
       delivered_at_by_session[session][cve_id] = iso
     - cvss_cache: CVSS 缓存（减少 NVD 请求）
       cvss_cache[cve_id] = {"stored_at_iso": "...", "data": {...}}
@@ -44,20 +44,15 @@ class JsonStateStore:
 
         self._lock = asyncio.Lock()
 
-        # in-memory
         self.pushed_at_by_cve: dict[str, str] = {}
         self.seen_at_by_cve: dict[str, str] = {}
         self.delivered_at_by_session: dict[str, dict[str, str]] = {}
-
-        # cvss_cache[cve_id] = {"stored_at_iso": "...", "data": {...}}
-        # 兼容旧版本：如果 value 本身是 dict，则直接按 dict 视为 data（stored_at_iso=None）
         self.cvss_cache: dict[str, dict[str, Any]] = {}
 
         self.last_catalog_version: str | None = None
         self.last_fetch_at_iso: str | None = None
         self.last_push_at_iso: str | None = None
 
-        # orders for pruning
         self._pushed_order: deque[str] = deque()
         self._seen_order: deque[str] = deque()
         self._delivered_order_by_session: dict[str, deque[str]] = {}
@@ -130,17 +125,14 @@ class JsonStateStore:
                 self._rebuild_orders()
 
     def _rebuild_orders(self) -> None:
-        # pushed
         pushed_items = list(self.pushed_at_by_cve.items())
         pushed_items.sort(key=lambda kv: kv[1])
         self._pushed_order = deque([cve for cve, _ in pushed_items])
 
-        # seen
         seen_items = list(self.seen_at_by_cve.items())
         seen_items.sort(key=lambda kv: kv[1])
         self._seen_order = deque([cve for cve, _ in seen_items])
 
-        # delivered
         self._delivered_order_by_session = {}
         for sess, m in self.delivered_at_by_session.items():
             if not isinstance(m, dict):
@@ -149,7 +141,6 @@ class JsonStateStore:
             items.sort(key=lambda kv: kv[1])
             self._delivered_order_by_session[sess] = deque([cve for cve, _ in items])
 
-        # cvss
         cvss_items: list[tuple[str, str]] = []
         for cve_id, v in self.cvss_cache.items():
             if not isinstance(v, dict):
@@ -179,9 +170,6 @@ class JsonStateStore:
             except Exception as e:
                 logger.error(f"[CVE漏洞推送] 状态保存失败: {e}")
 
-    # -------------------------
-    # pushed (legacy/global)
-    # -------------------------
     def is_cve_pushed(self, cve_id: str) -> bool:
         return cve_id in self.pushed_at_by_cve
 
@@ -191,9 +179,6 @@ class JsonStateStore:
         self._touch_order(self._pushed_order, cve_id)
         self._prune_dict_by_order(self.pushed_at_by_cve, self._pushed_order, self.state_max_entries)
 
-    # -------------------------
-    # seen (processed but maybe filtered)
-    # -------------------------
     def is_cve_seen(self, cve_id: str) -> bool:
         return cve_id in self.seen_at_by_cve
 
@@ -203,9 +188,6 @@ class JsonStateStore:
         self._touch_order(self._seen_order, cve_id)
         self._prune_dict_by_order(self.seen_at_by_cve, self._seen_order, self.seen_max_entries)
 
-    # -------------------------
-    # delivered (per session)
-    # -------------------------
     def is_cve_delivered(self, session: str, cve_id: str) -> bool:
         m = self.delivered_at_by_session.get(session)
         return bool(isinstance(m, dict) and cve_id in m)
@@ -230,9 +212,6 @@ class JsonStateStore:
             self.delivered_max_entries_per_session,
         )
 
-    # -------------------------
-    # CVSS cache
-    # -------------------------
     def get_cvss_cached(self, cve_id: str) -> dict[str, Any] | None:
         val = self.cvss_cache.get(cve_id)
         if not isinstance(val, dict):
@@ -253,7 +232,6 @@ class JsonStateStore:
                     self._delete_cvss_entry(cve_id)
                     return None
             except Exception:
-                # 时间戳损坏：删除，避免“僵尸缓存永久不过期”
                 self._delete_cvss_entry(cve_id)
                 return None
 
@@ -272,9 +250,6 @@ class JsonStateStore:
         except ValueError:
             pass
 
-    # -------------------------
-    # last_* metadata
-    # -------------------------
     def set_last_catalog_version(self, version: str | None) -> None:
         self.last_catalog_version = version
 
@@ -284,9 +259,6 @@ class JsonStateStore:
     def set_last_push_at(self, when_iso: str) -> None:
         self.last_push_at_iso = when_iso
 
-    # -------------------------
-    # internal helpers
-    # -------------------------
     @staticmethod
     def _touch_order(order: deque[str], key: str) -> None:
         if key in order:

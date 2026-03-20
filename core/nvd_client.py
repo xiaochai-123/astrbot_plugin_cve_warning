@@ -36,7 +36,6 @@ class NvdClient:
         }
         headers: dict[str, str] = {"User-Agent": self.user_agent}
         if self.api_key:
-            # NVD API 2.0 使用请求头 apiKey 字段
             headers["apiKey"] = self.api_key
 
         async with self.session.get(
@@ -76,7 +75,6 @@ class NvdClient:
                         if isinstance(val, str) and val.strip():
                             cwe_list.append(val.strip())
 
-        # CVSS v3.1 > v3.0 > v2.0
         def _pick_metric(key: str) -> dict[str, Any] | None:
             raw = metrics.get(key)
             if isinstance(raw, list) and raw:
@@ -85,27 +83,28 @@ class NvdClient:
                     return first
             return None
 
-        cvss_entry = _pick_metric("cvssMetricV31") or _pick_metric("cvssMetricV30") or _pick_metric("cvssMetricV2")
+        cvss_entry = (
+            _pick_metric("cvssMetricV31")
+            or _pick_metric("cvssMetricV30")
+            or _pick_metric("cvssMetricV2")
+        )
 
         cvss_base_score: float | None = None
         cvss_base_severity: str | None = None
         cvss_vector: str | None = None
 
         if isinstance(cvss_entry, dict):
-            # NVD 2.0 常见结构：字段在 cvssData 下
-            cvss_data = cvss_entry.get("cvssData") if isinstance(cvss_entry.get("cvssData"), dict) else None
-
-            base_score = None
-            base_sev = None
-            vector = None
+            cvss_data = (
+                cvss_entry.get("cvssData")
+                if isinstance(cvss_entry.get("cvssData"), dict)
+                else None
+            )
 
             if isinstance(cvss_data, dict):
                 base_score = cvss_data.get("baseScore")
-                # v3: baseSeverity 在 cvssData；v2 有时在 entry 顶层
                 base_sev = cvss_data.get("baseSeverity") or cvss_entry.get("baseSeverity")
                 vector = cvss_data.get("vectorString") or cvss_entry.get("vectorString")
             else:
-                # 兜底：旧逻辑（某些实现可能直接把字段放顶层）
                 base_score = cvss_entry.get("baseScore")
                 base_sev = cvss_entry.get("baseSeverity")
                 vector = cvss_entry.get("vectorString")

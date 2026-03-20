@@ -10,7 +10,6 @@ def _truncate(text: str, max_len: int) -> str:
     text = text.strip()
     if len(text) <= max_len:
         return text
-    # 留一点余量给省略号
     return text[: max(0, max_len - 1)] + "..."
 
 
@@ -30,21 +29,11 @@ def _severity_bucket(base_severity: str | None, base_score: float | None) -> str
     return "UNKNOWN"
 
 
-def get_severity_bucket(
-    base_severity: str | None,
-    base_score: float | None,
-) -> str:
-    """对外暴露：将 CVSS baseSeverity/baseScore 映射到严重等级桶。"""
+def get_severity_bucket(base_severity: str | None, base_score: float | None) -> str:
     return _severity_bucket(base_severity, base_score)
 
 
 def _parse_tz(display_timezone: str) -> timezone | None:
-    """
-    支持：
-    - "UTC"
-    - "UTC+8" / "UTC+08:00" / "UTC-5" 等
-    解析失败返回 None（则保持原字符串）
-    """
     if not isinstance(display_timezone, str):
         return None
     s = display_timezone.strip().upper()
@@ -59,7 +48,6 @@ def _parse_tz(display_timezone: str) -> timezone | None:
     if not tail:
         return timezone.utc
 
-    sign = 1
     if tail[0] == "+":
         sign = 1
         tail = tail[1:]
@@ -73,7 +61,6 @@ def _parse_tz(display_timezone: str) -> timezone | None:
     if not tail:
         return None
 
-    # "8" or "08:00"
     try:
         if ":" in tail:
             hh_str, mm_str = tail.split(":", 1)
@@ -89,18 +76,12 @@ def _parse_tz(display_timezone: str) -> timezone | None:
 
 
 def _format_kev_date(date_str: str, tz: timezone | None) -> str:
-    """
-    KEV 里 dateAdded/dueDate 通常是 YYYY-MM-DD（无时分秒）。
-    将其当作 UTC 的 00:00:00，再转换为 tz 显示（仅显示日期）。
-    解析失败返回原始字符串。
-    """
     if not isinstance(date_str, str) or not date_str.strip():
         return ""
     raw = date_str.strip()
     if tz is None:
         return raw
     try:
-        # treat as UTC date at midnight
         dt_utc = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         dt_local = dt_utc.astimezone(tz)
         return dt_local.strftime("%Y-%m-%d")
@@ -143,7 +124,6 @@ def build_cve_message(
     bucket = _severity_bucket(base_sev, base_score)
     detailed = critical_high_detailed and bucket in {"CRITICAL", "HIGH"}
 
-    # 简洁/详细两套模板
     description = _truncate(short_desc if short_desc else vuln_name, short_description_max_len)
     required_action = _truncate(required_action, short_description_max_len)
     nvd_link = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
@@ -155,36 +135,22 @@ def build_cve_message(
 
     header = f"🛡️ [CISA KEV] CVE 漏洞推送\nCVE：{cve_id}"
 
-    # 已知勒索使用信息（可选）
-    ransom_line = ""
-    if known_ransom:
-        ransom_line = f"\n🍷 勒索已知利用：{known_ransom}"
+    ransom_line = f"\n🍷 勒索已知利用：{known_ransom}" if known_ransom else ""
 
-    # 详细字段
     vendor_line = ""
     if vendor or product:
         vendor_line = f"\n🏢 影响范围：{vendor}{' / ' if vendor and product else ''}{product}".strip()
 
-    due_line = ""
-    if due_date_fmt:
-        due_line = f"\n⏰ 处置到期：{due_date_fmt}"
-    added_line = ""
-    if date_added_fmt:
-        added_line = f"\n📌 加入日期：{date_added_fmt}"
+    due_line = f"\n⏰ 处置到期：{due_date_fmt}" if due_date_fmt else ""
+    added_line = f"\n📌 加入日期：{date_added_fmt}" if date_added_fmt else ""
 
-    required_line = ""
-    if detailed and required_action:
-        required_line = f"\n📝 CISA 建议操作：{required_action}"
-
-    vector_line = ""
-    if detailed and vector:
-        vector_line = f"\n🧾 CVSS 向量：{vector}"
+    required_line = f"\n📝 CISA 建议操作：{required_action}" if (detailed and required_action) else ""
+    vector_line = f"\n🧾 CVSS 向量：{vector}" if (detailed and vector) else ""
 
     cwe_line = ""
     if detailed and include_cwe and isinstance(cwe_list, list) and cwe_list:
         cwe_line = f"\n🧩 CWE：{', '.join([str(x).strip() for x in cwe_list if str(x).strip()])}"
 
-    # 内容：简略 or 详细
     if detailed:
         return "\n".join(
             [
@@ -203,7 +169,6 @@ def build_cve_message(
             ]
         ).replace("\n\n\n", "\n\n")
 
-    # 简略模板
     return "\n".join(
         [
             header,

@@ -42,7 +42,6 @@ class CVEWarningPlugin(Star):
 
         if exc is not None:
             logger.error(f"[CVE漏洞推送] 后台服务异常退出: {exc!r}")
-            # 让状态命令能明确显示“服务存在但已死”
             self.service = None
             self._service_task = None
 
@@ -134,14 +133,12 @@ class CVEWarningPlugin(Star):
         if event.is_admin():
             return True
 
-        # 归一化为 str，避免平台返回 int/None 导致 in 判断恒 False
         sender_id = event.get_sender_id()
         sender_id_str = str(sender_id).strip() if sender_id is not None else ""
 
         raw_admins = self.config.get("admin_users", []) or []
         if not isinstance(raw_admins, list):
             return False
-
         plugin_admins = [str(x).strip() for x in raw_admins if str(x).strip()]
         return sender_id_str in plugin_admins
 
