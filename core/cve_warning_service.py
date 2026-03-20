@@ -114,7 +114,12 @@ class CVEWarningService:
         await self._state.load()
 
         self._running = True
-        await self.refresh_and_push(reason="startup")
+
+        try:
+            await self.refresh_and_push(reason="startup")
+        except Exception as e:
+            # startup 失败不应导致服务退出：记录更强日志，等待定时重试
+            logger.exception(f"[CVE漏洞推送] 启动时首次刷新失败（将进入定时重试）: {e}")
 
         self._loop_task = asyncio.create_task(self._run_loop(), name="cve_keV_scheduler")
         await self._loop_task
@@ -128,7 +133,7 @@ class CVEWarningService:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[CVE漏洞推送] 定时刷新失败: {e}")
+                logger.exception(f"[CVE漏洞推送] refresh_and_push 失败: {type(e).__name__} {e!r}")
 
     async def stop(self) -> None:
         self._running = False
@@ -177,13 +182,18 @@ class CVEWarningService:
                     except Exception as fetch_e:
                         last_fetch_err = fetch_e
                         logger.warning(
-                            f"[CVE漏洞推送] KEV 拉取失败（第 {attempt}/{self.kev_fetch_retry_count} 次）: {fetch_e}"
+                            f"[CVE漏洞推送] KEV 拉取失败（第 {attempt}/{self.kev_fetch_retry_count} 次）: "
+                            f"{type(fetch_e).__name__} {fetch_e!r}"
                         )
                         if attempt < self.kev_fetch_retry_count:
                             await asyncio.sleep(self.kev_fetch_retry_interval_seconds)
 
                 if catalog is None:
-                    raise RuntimeError(f"KEV 拉取失败: {last_fetch_err}")
+                    raise RuntimeError(
+                        "KEV 拉取失败: "
+                        f"{type(last_fetch_err).__name__ if last_fetch_err else 'UnknownError'} "
+                        f"{last_fetch_err!r}"
+                    )
 
                 catalog_version = catalog.get("catalogVersion") if isinstance(catalog, dict) else None
                 entries = []
@@ -297,7 +307,7 @@ class CVEWarningService:
 
             except Exception as e:
                 result.ok = False
-                result.error = str(e)
+                result.error = f"{type(e).__name__} {e!r}"
                 logger.error(f"[CVE漏洞推送] refresh_and_push 失败: {e}")
 
                 if self.failure_notify_sessions and reason in {"startup", "manual"}:
