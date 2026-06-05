@@ -50,8 +50,10 @@
 ### 拉取与推送
 
 - `kev_feed_url`：CISA KEV 数据源（默认指向 cisa.gov，通常无需修改）
+- `http_proxy`：HTTP 请求代理地址，作用于 KEV/NVD 请求，例如 `http://127.0.0.1:7890`；留空则直连
 - `push_interval_hours`：刷新间隔（小时），默认 `6`
 - `max_push_per_run`：单次最多推送条目数，默认 `30`
+- `min_date_added`：最早 KEV 加入日期，格式 `YYYYMMDD`（例如 `20260605`）。早于该 `dateAdded` 的漏洞不会通知；留空则不限制。
 
 ### 严重等级与展示
 
@@ -105,6 +107,7 @@
 插件会在 AstrBot 的插件数据目录下写入 `state.json`，用于：
 
 - 去重：记录已推送过的 CVE
+- 策略压制：记录在低危通知关闭时暂不推送的 Low/Medium/Unknown CVE，避免它们反复占用单轮推送队列；之后开启低危通知时仍可补推这些未推送 CVE
 - 缓存：记录 CVSS 查询结果并按 TTL 过期
 
 > 注意：如果你清空该状态文件，插件会把历史 CVE 视为“未推送”，可能导致重新推送。
