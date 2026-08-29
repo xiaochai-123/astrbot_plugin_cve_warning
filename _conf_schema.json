@@ -23,6 +23,12 @@
     "hint": "不建议修改，除非你有自建镜像。",
     "default": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
   },
+  "http_proxy": {
+    "description": "HTTP 请求代理地址",
+    "type": "string",
+    "hint": "用于 KEV/NVD 请求代理，例如 http://127.0.0.1:7890。留空则直连。",
+    "default": ""
+  },
   "push_interval_hours": {
     "description": "拉取间隔（小时）",
     "type": "int",
@@ -44,6 +50,12 @@
       "max": 200,
       "step": 1
     }
+  },
+  "min_date_added": {
+    "description": "最早漏洞加入日期",
+    "type": "string",
+    "hint": "格式: YYYYMMDD，例如 20260605。KEV dateAdded 早于该日期的漏洞不会通知；留空则不限制。",
+    "default": ""
   },
   "display_timezone": {
     "description": "显示时区",
@@ -160,4 +172,3 @@
     }
   }
 }
-

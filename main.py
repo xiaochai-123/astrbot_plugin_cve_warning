@@ -92,6 +92,8 @@ class CVEWarningPlugin(Star):
                 f"📣 last_push_at_iso: {st.get('last_push_at_iso')}",
                 f"⏭️ next_run_at: {st.get('next_run_at')}",
                 f"🔢 pushed_count: {st.get('pushed_count')}",
+                f"📅 min_date_added: {st.get('min_date_added')}",
+                f"🌐 http_proxy_configured: {st.get('http_proxy_configured')}",
                 f"ℹ️ enable_low_medium: {self.config.get('enable_low_medium', False)}",
                 f"ℹ️ push_interval_hours: {self.config.get('push_interval_hours', 6)}",
             ]
@@ -122,6 +124,8 @@ class CVEWarningPlugin(Star):
                 f"pushed={getattr(res, 'pushed', 0)} "
                 f"processed={getattr(res, 'processed', 0)} "
                 f"skipped_by_severity={getattr(res, 'skipped_by_severity', 0)} "
+                f"skipped_by_min_date={getattr(res, 'skipped_by_min_date', 0)} "
+                f"skipped_suppressed={getattr(res, 'skipped_suppressed', 0)} "
                 f"skipped_already_pushed={getattr(res, 'skipped_already_pushed', 0)} "
                 f"skipped_already_delivered={getattr(res, 'skipped_already_delivered', 0)}"
             )

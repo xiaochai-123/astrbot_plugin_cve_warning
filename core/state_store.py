@@ -14,6 +14,7 @@ class JsonStateStore:
     轻量状态存储：
     - pushed_at_by_cve: 全局“该 CVE 已完成推送”（legacy；用于 push_only_new 逻辑）
     - seen_at_by_cve:   “该 CVE 已被扫描到/处理过”（severity 过滤时避免每轮都命中）
+    - suppressed_at_by_cve: “该 CVE 因当前策略暂不推送”（例如低危通知关闭）
     - delivered_at_by_session: 按 session 粒度记录投递成功状态
       delivered_at_by_session[session][cve_id] = iso
     - cvss_cache: CVSS 缓存（减少 NVD 请求）
@@ -46,6 +47,7 @@ class JsonStateStore:
 
         self.pushed_at_by_cve: dict[str, str] = {}
         self.seen_at_by_cve: dict[str, str] = {}
+        self.suppressed_at_by_cve: dict[str, dict[str, Any]] = {}
         self.delivered_at_by_session: dict[str, dict[str, str]] = {}
         self.cvss_cache: dict[str, dict[str, Any]] = {}
 
@@ -55,6 +57,7 @@ class JsonStateStore:
 
         self._pushed_order: deque[str] = deque()
         self._seen_order: deque[str] = deque()
+        self._suppressed_order: deque[str] = deque()
         self._delivered_order_by_session: dict[str, deque[str]] = {}
         self._cvss_order: deque[str] = deque()
 
@@ -88,6 +91,18 @@ class JsonStateStore:
                         for k, v in seen.items()
                         if isinstance(k, str) and isinstance(v, str)
                     }
+
+                suppressed = data.get("suppressed_at_by_cve", {})
+                rebuilt_suppressed: dict[str, dict[str, Any]] = {}
+                if isinstance(suppressed, dict):
+                    for cve, info in suppressed.items():
+                        if not isinstance(cve, str):
+                            continue
+                        if isinstance(info, dict):
+                            rebuilt_suppressed[cve] = info
+                        elif isinstance(info, str):
+                            rebuilt_suppressed[cve] = {"suppressed_at_iso": info}
+                self.suppressed_at_by_cve = rebuilt_suppressed
 
                 delivered = data.get("delivered_at_by_session", {})
                 rebuilt_delivered: dict[str, dict[str, str]] = {}
@@ -133,6 +148,15 @@ class JsonStateStore:
         seen_items.sort(key=lambda kv: kv[1])
         self._seen_order = deque([cve for cve, _ in seen_items])
 
+        suppressed_items: list[tuple[str, str]] = []
+        for cve_id, info in self.suppressed_at_by_cve.items():
+            if not isinstance(info, dict):
+                continue
+            ts = info.get("suppressed_at_iso")
+            suppressed_items.append((cve_id, ts if isinstance(ts, str) else ""))
+        suppressed_items.sort(key=lambda kv: kv[1])
+        self._suppressed_order = deque([cve for cve, _ in suppressed_items])
+
         self._delivered_order_by_session = {}
         for sess, m in self.delivered_at_by_session.items():
             if not isinstance(m, dict):
@@ -157,6 +181,7 @@ class JsonStateStore:
                 payload = {
                     "pushed_at_by_cve": self.pushed_at_by_cve,
                     "seen_at_by_cve": self.seen_at_by_cve,
+                    "suppressed_at_by_cve": self.suppressed_at_by_cve,
                     "delivered_at_by_session": self.delivered_at_by_session,
                     "cvss_cache": self.cvss_cache,
                     "last_catalog_version": self.last_catalog_version,
@@ -187,6 +212,26 @@ class JsonStateStore:
         self.seen_at_by_cve[cve_id] = now_iso
         self._touch_order(self._seen_order, cve_id)
         self._prune_dict_by_order(self.seen_at_by_cve, self._seen_order, self.seen_max_entries)
+
+    def is_cve_suppressed(self, cve_id: str) -> bool:
+        return cve_id in self.suppressed_at_by_cve
+
+    async def mark_cve_suppressed(self, cve_id: str, *, bucket: str, date_added: str) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self.suppressed_at_by_cve[cve_id] = {
+            "suppressed_at_iso": now_iso,
+            "bucket": str(bucket or "").strip().upper(),
+            "date_added": str(date_added or "").strip(),
+        }
+        self._touch_order(self._suppressed_order, cve_id)
+        self._prune_dict_by_order(self.suppressed_at_by_cve, self._suppressed_order, self.seen_max_entries)
+
+    async def clear_cve_suppressed(self, cve_id: str) -> None:
+        self.suppressed_at_by_cve.pop(cve_id, None)
+        try:
+            self._suppressed_order.remove(cve_id)
+        except ValueError:
+            pass
 
     def is_cve_delivered(self, session: str, cve_id: str) -> bool:
         m = self.delivered_at_by_session.get(session)
@@ -277,6 +322,7 @@ class JsonStateStore:
     def _prune_all_unsafe(self) -> None:
         self._prune_dict_by_order(self.pushed_at_by_cve, self._pushed_order, self.state_max_entries)
         self._prune_dict_by_order(self.seen_at_by_cve, self._seen_order, self.seen_max_entries)
+        self._prune_dict_by_order(self.suppressed_at_by_cve, self._suppressed_order, self.seen_max_entries)
         self._prune_dict_by_order(self.cvss_cache, self._cvss_order, self.cvss_cache_max_entries)
 
         for sess, m in list(self.delivered_at_by_session.items()):

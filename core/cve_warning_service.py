@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Any
 
 import aiohttp
@@ -27,6 +27,8 @@ class RefreshResult:
 
     skipped_already_pushed: int = 0
     skipped_by_severity: int = 0
+    skipped_by_min_date: int = 0
+    skipped_suppressed: int = 0
     skipped_already_delivered: int = 0
 
     last_catalog_version: str | None = None
@@ -43,6 +45,14 @@ class CVEWarningService:
         self.interval_hours = int(config.get("push_interval_hours", 6))
         self.interval_seconds = max(60, self.interval_hours * 3600)
         self.max_push_per_run = int(config.get("max_push_per_run", 30))
+        self.http_proxy = str(config.get("http_proxy") or "").strip()
+        self.min_date_added_raw = str(config.get("min_date_added") or "").strip()
+        self.min_date_added = self._parse_min_date_added(self.min_date_added_raw)
+        if self.min_date_added_raw and self.min_date_added is None:
+            logger.warning(
+                "[CVE漏洞推送] min_date_added 配置无效，应使用 YYYYMMDD 格式，例如 20260605；"
+                "本次将不启用最早日期过滤。"
+            )
 
         self.display_timezone = str(config.get("display_timezone") or "UTC+8")
         self.enable_low_medium = bool(config.get("enable_low_medium", False))
@@ -104,11 +114,17 @@ class CVEWarningService:
             logger.warning("[CVE漏洞推送] 当前未配置 target_sessions，将只更新状态不推送消息。")
 
         self._session = aiohttp.ClientSession()
-        self._kev_client = CisaKevClient(self._session, feed_url=self.kev_feed_url, timeout_s=30)
+        self._kev_client = CisaKevClient(
+            self._session,
+            feed_url=self.kev_feed_url,
+            timeout_s=30,
+            proxy_url=self.http_proxy,
+        )
         self._nvd_client = NvdClient(
             self._session,
             api_key=self.nvd_api_key,
             timeout_s=self.nvd_timeout_seconds,
+            proxy_url=self.http_proxy,
         )
 
         await self._state.load()
@@ -159,6 +175,8 @@ class CVEWarningService:
             "last_refresh_at": self._last_refresh_at.isoformat() if self._last_refresh_at else None,
             "next_run_at": self._next_run_at.isoformat() if self._next_run_at else None,
             "pushed_count": len(self._state.pushed_at_by_cve),
+            "min_date_added": self.min_date_added_raw if self.min_date_added else None,
+            "http_proxy_configured": bool(self.http_proxy),
         }
 
     async def refresh_and_push(self, reason: str) -> RefreshResult:
@@ -211,7 +229,7 @@ class CVEWarningService:
                     await self._state.save()
                     return result
 
-                candidates: list[dict[str, Any]] = []
+                push_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
                 skipped = 0
                 for e in entries:
                     cve_id = str(e.get("cveID") or "").strip()
@@ -220,14 +238,9 @@ class CVEWarningService:
                     if self.push_only_new and self._state.is_cve_pushed(cve_id):
                         skipped += 1
                         continue
-                    candidates.append(e)
-                result.skipped_already_pushed = skipped
 
-                candidates = candidates[: self.max_push_per_run]
-
-                for entry in candidates:
-                    cve_id = str(entry.get("cveID") or "").strip()
-                    if not cve_id:
+                    if self._is_before_min_date_added(e):
+                        result.skipped_by_min_date += 1
                         continue
 
                     if self.target_sessions:
@@ -237,7 +250,12 @@ class CVEWarningService:
                             result.processed += 1
                             if not self._state.is_cve_pushed(cve_id):
                                 await self._state.mark_cve_pushed(cve_id)
+                            await self._state.clear_cve_suppressed(cve_id)
                             continue
+
+                    if (not self.enable_low_medium) and self._state.is_cve_suppressed(cve_id):
+                        result.skipped_suppressed += 1
+                        continue
 
                     cvss_info = self._state.get_cvss_cached(cve_id)
                     if not cvss_info:
@@ -262,6 +280,22 @@ class CVEWarningService:
                         result.skipped_by_severity += 1
                         result.processed += 1
                         await self._state.mark_cve_seen(cve_id)
+                        await self._state.mark_cve_suppressed(
+                            cve_id,
+                            bucket=bucket,
+                            date_added=str(e.get("dateAdded") or "").strip(),
+                        )
+                        continue
+
+                    push_candidates.append((e, cvss_info))
+                    if len(push_candidates) >= self.max_push_per_run:
+                        break
+
+                result.skipped_already_pushed = skipped
+
+                for entry, cvss_info in push_candidates:
+                    cve_id = str(entry.get("cveID") or "").strip()
+                    if not cve_id:
                         continue
 
                     msg_text = build_cve_message(
@@ -297,6 +331,7 @@ class CVEWarningService:
                     if ok_any and ok_all:
                         if not self._state.is_cve_pushed(cve_id):
                             await self._state.mark_cve_pushed(cve_id)
+                        await self._state.clear_cve_suppressed(cve_id)
                         result.pushed += 1
                         self._state.set_last_push_at(datetime.now(timezone.utc).isoformat())
                     else:
@@ -332,3 +367,34 @@ class CVEWarningService:
             if isinstance(v, str) and v.strip():
                 result.append(v.strip())
         return result
+
+    @staticmethod
+    def _parse_min_date_added(value: str) -> date | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        for fmt in ("%Y%m%d", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _parse_kev_date_added(value: Any) -> date | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    def _is_before_min_date_added(self, entry: dict[str, Any]) -> bool:
+        if self.min_date_added is None:
+            return False
+        entry_date = self._parse_kev_date_added(entry.get("dateAdded"))
+        if entry_date is None:
+            # min_date_added 启用时，不处理缺少有效 dateAdded 的条目，避免误推历史数据。
+            return True
+        return entry_date < self.min_date_added

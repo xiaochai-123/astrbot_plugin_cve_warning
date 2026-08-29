@@ -7,10 +7,11 @@ import aiohttp
 
 
 class CisaKevClient:
-    def __init__(self, session: aiohttp.ClientSession, feed_url: str, timeout_s: int):
+    def __init__(self, session: aiohttp.ClientSession, feed_url: str, timeout_s: int, proxy_url: str = ""):
         self.session = session
         self.feed_url = feed_url
         self.timeout_s = int(timeout_s)
+        self.proxy_url = str(proxy_url or "").strip() or None
 
     async def fetch_catalog(self) -> dict[str, Any]:
         try:
@@ -21,6 +22,7 @@ class CisaKevClient:
                 self.feed_url,
                 timeout=timeout,
                 headers=headers,
+                proxy=self.proxy_url,
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json(content_type=None)

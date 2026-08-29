@@ -12,11 +12,13 @@ class NvdClient:
         api_key: str = "",
         timeout_s: int = 12,
         user_agent: str = "astrbot-cve-warning",
+        proxy_url: str = "",
     ) -> None:
         self.session = session
         self.api_key = api_key or ""
         self.timeout_s = timeout_s
         self.user_agent = user_agent
+        self.proxy_url = str(proxy_url or "").strip() or None
 
         self._base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
@@ -43,6 +45,7 @@ class NvdClient:
             params=params,
             headers=headers,
             timeout=self.timeout_s,
+            proxy=self.proxy_url,
         ) as resp:
             resp.raise_for_status()
             data = await resp.json(content_type=None)
